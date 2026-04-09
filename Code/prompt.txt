@@ -1,0 +1,294 @@
+Corrections:
+
+Center frame index:
+Your assumption of index 3 is WRONG.
+The correct center index is 4 (0-based).
+
+Proof from my verified sidecar build logic:
+frame_indices[i] = center_frame + (i - clip_len // 2)
+For clip_len=8: center_frame appears at i=4
+
+My sidecar record explicitly stores:
+center_idx = clip_len // 2 = 4
+
+This is verified — sources[4] == "gt" for every single sample
+in both train and val (check #6 in verify_temporal_tracks.py).
+
+Use center_idx = 4 everywhere:
+
+Mode 0/1: select temporal slice t = T_feat // 2 (or the
+subsampled index that maps to position 4)
+Temporal subsampling: ensure position 4 survives
+Geometry at center frame (Mode 1):
+Yes, boxes[:, center_idx, :] is correct.
+At center_idx=4, the sidecar always contains the GT box
+(source="gt", valid_mask=1, verified).
+So this is equivalent to using the GT box from the CSV.
+
+Dataset import:
+Correct. Use:
+
+from temporal_track_dataset import TemporalTrackDataset
+
+Constructor:
+TemporalTrackDataset(
+actor_csv_path,
+sidecar_pkl_path,
+frame_root,
+clip_len=8,
+min_track_quality=0.0,
+transform=None,
+)
+
+Returns per sample:
+frames: (T, 3, 256, 256) float32 [0,1]
+boxes: (T, 4) float32 normalized
+valid_mask: (T,) int64
+labels: (80,) float32 multi-hot
+metadata: dict
+
+After DataLoader batching:
+frames: (B, 8, 3, 256, 256) → permute to (B, 3, 8, 256, 256) in model
+boxes: (B, 8, 4)
+valid_mask: (B, 8)
+labels: (B, 80)
+
+Good. Now generate the model architecture.
+
+Generate ONE file:
+
+E:\Ava\Code\models\actor_model.py
+
+This file contains the full model with config flags to support
+4 experimental modes:
+
+baseline0: keyframe RoI only
+baseline1: keyframe RoI + geometry branch
+ablation2: temporal pooling, feature-only MLP scorer
+ablation3: geometry-conditioned temporal attention + valid_mask
+
+All modes in ONE nn.Module class.
+
+==================================================
+BACKBONE
+Use pytorchvideo X3D-XS.
+
+To create and load pretrained:
+
+text
+
+from pytorchvideo.models.x3d import create_x3d
+
+model = create_x3d(
+    input_clip_length=8,
+    input_crop_size=256,
+    model_num_class=400,
+)
+Or use torch hub:
+
+text
+
+model = torch.hub.load(
+    "facebookresearch/pytorchvideo",
+    "x3d_xs",
+    pretrained=True
+)
+Use WHICHEVER method works. If one fails, use the other.
+The important thing is: pretrained Kinetics-400 weights loaded.
+
+Extract the last conv stage output BEFORE final pool and head.
+This requires inspecting the model structure.
+
+At init time:
+
+Load the full pretrained model
+Print the model structure (or key layer names) so I can see it
+Remove or bypass the head (pool + projection + FC)
+Keep only stem + stages as self.backbone
+Freeze all backbone parameters
+IMPORTANT: print the actual feature map shape at init using a
+dummy forward pass:
+dummy = torch.zeros(1, 3, 8, 256, 256)
+feat = self.backbone(dummy)
+print(f"Feature map shape: {feat.shape}")
+This tells us C_feat, T_feat, H_feat, W_feat exactly.
+
+Apply Kinetics normalization inside the model forward:
+mean = [0.45, 0.45, 0.45]
+std = [0.225, 0.225, 0.225]
+Register these as buffers (not parameters).
+
+==================================================
+ROI ALIGN
+Use torchvision.ops.roi_align.
+
+For each temporal position t:
+spatial_feat = feat[:, :, t, :, :] → (B, C_feat, H_feat, W_feat)
+
+text
+
+boxes are normalized [0,1]. Scale to feature map coords:
+    x1_abs = x1 * W_feat
+    y1_abs = y1 * H_feat
+    x2_abs = x2 * W_feat
+    y2_abs = y2 * H_feat
+
+Format for roi_align: list of (N_i, 4) tensors per batch item,
+or use (K, 5) format with [batch_idx, x1, y1, x2, y2].
+
+Since batch_size = B and each sample has exactly 1 actor:
+    roi_boxes = torch.cat([batch_indices, scaled_boxes], dim=1)
+    where batch_indices = torch.arange(B).unsqueeze(1)
+
+roi_out = roi_align(spatial_feat, roi_boxes, output_size=roi_size,
+                    spatial_scale=1.0)
+→ (B, C_feat, roi_size, roi_size)
+
+Pool: adaptive_avg_pool2d → (B, C_feat, 1, 1) → squeeze → (B, C_feat)
+Stack across T_feat positions → (B, T_feat, C_feat)
+
+Temporal alignment:
+If T_feat < T_input (8):
+boxes: (B, 8, 4) → subsample to (B, T_feat, 4)
+valid_mask: (B, 8) → subsample to (B, T_feat)
+Use uniform spacing: indices = linspace(0, 7, T_feat).long()
+Store these indices as a buffer
+Log the mapping at init
+
+baseline0: only use center position (t = T_feat // 2)
+Result: (B, C_feat) → MLP head
+
+baseline1 / ablation2 / ablation3: use all T_feat positions
+Result: (B, T_feat, C_feat) → temporal processing
+
+==================================================
+GEOMETRY ENCODER
+Compute from boxes:
+width = x2 - x1
+height = y2 - y1
+area = width * height
+cx = (x1 + x2) / 2
+cy = (y1 + y2) / 2
+aspect = width / (height + 1e-6)
+→ (B, T, 6) or (B, 6) for center-only
+
+baseline1 geometry:
+geo_feat = geo_mlp(geo_6d_at_center) → (B, C_feat)
+geo_gate = sigmoid(geo_feat)
+actor_feat = actor_feat * geo_gate
+geo_mlp: Linear(6, 32) → ReLU → Linear(32, C_feat) → sigmoid
+Applied BEFORE MLP head
+
+ablation3 geometry:
+geo_feat = geo_encoder(geo_6d_at_each_t) → (B, T_feat, D_geo)
+geo_encoder: Linear(6, 32) → ReLU → Linear(32, D_geo)
+D_geo = 32 (configurable)
+Fed into temporal scorer alongside actor features
+
+==================================================
+TEMPORAL POOLING — ablation2
+text
+
+score_t = temporal_scorer(actor_feat_t)
+temporal_scorer: Linear(C_feat, 64) → ReLU → Linear(64, 1)
+
+scores: (B, T_feat, 1) → squeeze → (B, T_feat)
+alpha = softmax(scores, dim=1)
+pooled = (alpha.unsqueeze(-1) * actor_feats).sum(dim=1)
+→ (B, C_feat)
+Then MLP head
+==================================================
+TEMPORAL ATTENTION — ablation3 (NOVELTY)
+text
+
+combined = concat(actor_feat_t, geo_feat_t)  dim=-1
+score_t = temporal_scorer(combined_t)
+temporal_scorer: Linear(C_feat + D_geo, 64) → ReLU → Linear(64, 1)
+
+scores: (B, T_feat)
+
+# valid_mask modulation
+if valid_mask is not None:
+    mask = subsample valid_mask to T_feat if needed
+    scores = scores + (1 - mask.float()) * self.mask_bias
+
+alpha = softmax(scores, dim=1)
+pooled = (alpha.unsqueeze(-1) * actor_feats).sum(dim=1)
+→ (B, C_feat)
+Then MLP head
+
+mask_bias: default -5.0, stored as nn.Parameter if learnable,
+else as buffer
+==================================================
+MLP HEAD
+text
+
+Linear(C_feat, 256) → ReLU → Dropout(0.3) → Linear(256, 80)
+No sigmoid (BCEWithLogitsLoss in training)
+==================================================
+CONFIG DATACLASS
+text
+
+@dataclass
+class ModelConfig:
+    mode: str = "baseline0"
+    backbone_frozen: bool = True
+    roi_output_size: int = 7
+    geo_hidden: int = 32
+    geo_out_dim: int = 32
+    temporal_hidden: int = 64
+    head_hidden: int = 256
+    head_dropout: float = 0.3
+    mask_bias: float = -5.0
+    learnable_mask_bias: bool = False
+    num_classes: int = 80
+==================================================
+SMOKE TEST
+At the bottom of the file:
+
+text
+
+if __name__ == "__main__":
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    for mode in ["baseline0", "baseline1", "ablation2", "ablation3"]:
+        print(f"\n{'='*60}")
+        print(f"Testing mode: {mode}")
+        print(f"{'='*60}")
+
+        config = ModelConfig(mode=mode)
+        model = ActorActionModel(config).to(device)
+
+        B = 2
+        frames = torch.randn(B, 8, 3, 256, 256).to(device)
+        boxes = torch.rand(B, 8, 4).to(device)
+        boxes[:, :, 2:] = boxes[:, :, :2] + 0.2  # ensure x2>x1, y2>y1
+        boxes = boxes.clamp(0, 1)
+        valid_mask = torch.ones(B, 8, dtype=torch.long).to(device)
+
+        with torch.no_grad():
+            logits = model(frames, boxes, valid_mask)
+
+        print(f"Output shape: {logits.shape}")
+        print(f"Total params: {sum(p.numel() for p in model.parameters()):,}")
+        print(f"Trainable params: {sum(p.numel() for p in model.parameters() if p.requires_grad):,}")
+        print(f"PASS")
+==================================================
+CODE RULES
+one file: actor_model.py
+clean PyTorch nn.Module
+type hints
+docstrings
+no external frameworks except pytorchvideo (backbone) and torchvision (roi_align)
+Windows-safe
+fully runnable
+==================================================
+OUTPUT
+Give me:
+
+Complete actor_model.py
+Expected smoke test output
+pip install commands if any new dependencies
+The actual T_feat value (from the dummy forward pass print)
+Any warnings or uncertainties about the backbone feature extraction
+Do NOT generate training loop code. ONLY the model file.
